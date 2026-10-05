@@ -1,5 +1,6 @@
-"""HTTP 网关：POST /api/telemetry/events 的验签、解压、校验与防重放接纳。
+"""HTTP 网关：事件接纳与回执恢复。
 
+POST /api/telemetry/events —— 验签、解压、校验与防重放接纳。
 处理顺序（严格保证"先验签，再解压/校验"，且失败请求不占用 nonce）：
 
     1. 必需请求头齐全且格式合法          -> 400 MALFORMED_HEADERS
@@ -10,6 +11,19 @@
     6. 解压 + JSON 解析 + 事件校验        -> 400 PAYLOAD_MALFORMED / 415 UNSUPPORTED_ENCODING
     7. 事务性登记 nonce（唯一约束）       -> 409 NONCE_REPLAY
     8. 接纳                              -> 202 + 稳定事件摘要
+
+POST /api/telemetry/events/recover —— 专网抖动丢失 202 后的回执恢复。
+沿用接纳接口的鉴权头、JSON/gzip 载荷与签名规则，仅规范化串中的路径改为恢复
+路径；处理到第 6 步（载荷校验）后改为只读核对：
+
+    * 全部一致                        -> 200 status=recovered + 首次接纳的
+                                         event_digest / received_at
+    * 该站点 nonce 从未成功接纳        -> 404 RECEIPT_NOT_FOUND
+    * nonce 有记录但事件摘要不一致     -> 409 RECEIPT_MISMATCH
+    * 旧数据卷仅有防重放记录（无摘要） -> 409 RECEIPT_UNAVAILABLE
+
+恢复操作只做 SELECT，绝不登记或改写 nonce/事件记录；查询按站点隔离，
+不会泄露其他站点的结果。
 """
 from __future__ import annotations
 
@@ -21,6 +35,7 @@ import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import NamedTuple
 
 from . import auth
 from . import payload as payload_mod
@@ -32,6 +47,7 @@ from .store import Store
 log = logging.getLogger("gateway")
 
 EVENTS_PATH = "/api/telemetry/events"
+RECOVER_PATH = "/api/telemetry/events/recover"
 _NONCE_RE = re.compile(r"[A-Za-z0-9._~-]{8,128}")
 
 
@@ -42,6 +58,16 @@ class Gateway:
         self.config = config
         self.keystore = keystore
         self.store = store
+
+
+class _Authenticated(NamedTuple):
+    """通过头/时间窗/密钥/签名校验后的请求要素。"""
+
+    station_id: str
+    key_id: str
+    nonce: str
+    raw_body: bytes
+    now: float
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -57,9 +83,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path != EVENTS_PATH:
+            if self.path == EVENTS_PATH:
+                status, body = self._handle_events()
+            elif self.path == RECOVER_PATH:
+                status, body = self._handle_recover()
+            else:
                 raise ApiError(404, "NOT_FOUND", "unknown path")
-            status, body = self._handle_events()
         except ApiError as exc:
             status, body = exc.status, exc.to_dict()
             log.info("reject %s -> %d %s", self.path, exc.status, exc.code)
@@ -74,8 +103,76 @@ class Handler(BaseHTTPRequestHandler):
     do_DELETE = do_PUT
     do_PATCH = do_PUT
 
-    # ---------- 主流程 ----------
+    # ---------- 接纳 ----------
     def _handle_events(self) -> tuple[int, dict]:
+        gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
+        authn = self._authenticate(EVENTS_PATH)
+
+        # 验签通过后才解压、解析、校验事件
+        data = payload_mod.maybe_decompress(
+            authn.raw_body, self.headers.get("Content-Encoding"),
+            gateway.config.max_decompressed_bytes)
+        obj = payload_mod.parse_and_validate(data, authn.station_id, authn.now)
+        digest, canonical_payload = payload_mod.stable_digest(obj)
+
+        # 全部校验通过，事务性登记 nonce；冲突即重放
+        accepted = gateway.store.record_acceptance(
+            authn.station_id, authn.nonce, authn.key_id,
+            digest, canonical_payload, authn.now)
+        if not accepted:
+            raise ApiError(409, "NONCE_REPLAY", "nonce already used for this station")
+
+        log.info("accepted station=%s key=%s nonce=%s digest=%s",
+                 authn.station_id, authn.key_id, authn.nonce, digest)
+        return 202, {
+            "status": "accepted",
+            "station_id": authn.station_id,
+            "nonce": authn.nonce,
+            "event_digest": digest,
+            "received_at": int(authn.now),
+        }
+
+    # ---------- 回执恢复 ----------
+    def _handle_recover(self) -> tuple[int, dict]:
+        gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
+        # 与接纳接口完全相同的头/时间窗/密钥/载荷/签名校验，
+        # 唯一区别是签名规范化串使用恢复路径。
+        authn = self._authenticate(RECOVER_PATH)
+
+        data = payload_mod.maybe_decompress(
+            authn.raw_body, self.headers.get("Content-Encoding"),
+            gateway.config.max_decompressed_bytes)
+        obj = payload_mod.parse_and_validate(data, authn.station_id, authn.now)
+        digest, _ = payload_mod.stable_digest(obj)
+
+        # 只读核对：绝不登记或改写任何 nonce/事件记录
+        receipt = gateway.store.lookup_receipt(authn.station_id, authn.nonce)
+        if receipt is None:
+            raise ApiError(404, "RECEIPT_NOT_FOUND",
+                           "no accepted event for this station and nonce")
+        if receipt.digest is None:
+            raise ApiError(409, "RECEIPT_UNAVAILABLE",
+                           "legacy anti-replay record without event digest")
+        if receipt.digest != digest:
+            raise ApiError(409, "RECEIPT_MISMATCH",
+                           "accepted event digest differs from recovery payload")
+
+        log.info("recovered station=%s nonce=%s digest=%s",
+                 authn.station_id, authn.nonce, receipt.digest)
+        return 200, {
+            "status": "recovered",
+            "station_id": authn.station_id,
+            "nonce": authn.nonce,
+            "event_digest": receipt.digest,
+            "received_at": int(receipt.used_at),
+        }
+
+    # ---------- 共享鉴权链 ----------
+    def _authenticate(self, sign_path: str) -> _Authenticated:
+        """接纳与恢复共用的校验链：头 -> 原始体 -> 时间窗 -> 密钥 -> 验签。
+
+        sign_path 为签名规范化串中使用的路径（两个接口仅此一项不同）。
+        """
         gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
         config = gateway.config
 
@@ -113,33 +210,13 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "KEY_STATION_MISMATCH",
                            "key is not registered for this station")
 
-        canonical = auth.canonical_string("POST", EVENTS_PATH, station_id, key_id,
+        canonical = auth.canonical_string("POST", sign_path, station_id, key_id,
                                           ts_raw, nonce, raw_body)
         if not auth.verify_signature(key.secret, canonical, signature):
             raise ApiError(401, "SIGNATURE_INVALID", "signature verification failed")
 
-        # 验签通过后才解压、解析、校验事件
-        data = payload_mod.maybe_decompress(
-            raw_body, self.headers.get("Content-Encoding"),
-            config.max_decompressed_bytes)
-        obj = payload_mod.parse_and_validate(data, station_id, now)
-        digest, canonical_payload = payload_mod.stable_digest(obj)
-
-        # 全部校验通过，事务性登记 nonce；冲突即重放
-        accepted = gateway.store.record_acceptance(
-            station_id, nonce, key_id, digest, canonical_payload, now)
-        if not accepted:
-            raise ApiError(409, "NONCE_REPLAY", "nonce already used for this station")
-
-        log.info("accepted station=%s key=%s nonce=%s digest=%s",
-                 station_id, key_id, nonce, digest)
-        return 202, {
-            "status": "accepted",
-            "station_id": station_id,
-            "nonce": nonce,
-            "event_digest": digest,
-            "received_at": int(now),
-        }
+        return _Authenticated(station_id=station_id, key_id=key_id, nonce=nonce,
+                              raw_body=raw_body, now=now)
 
     # ---------- 工具 ----------
     def _required_header(self, name: str) -> str:

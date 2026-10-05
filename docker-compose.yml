@@ -38,7 +38,11 @@ services:
     environment:
       GATEWAY_URL: http://app:8000
       KEYS_FILE: /app/keys/keys.json
-    # 一次性服务：构建检查 + 单元测试 + 签名/压缩/并发防重放冒烟，退出码汇总结果
+      # 冒烟"旧数据卷"场景需要直接核对/改写 SQLite 中的历史 nonce 行
+      DATA_DIR: /data
+    volumes:
+      - app-data:/data
+    # 一次性服务：构建检查 + 单元测试 + 签名/压缩/并发防重放/回执恢复冒烟，退出码汇总结果
     command: ["python", "-m", "verify.run"]
     restart: "no"
 
