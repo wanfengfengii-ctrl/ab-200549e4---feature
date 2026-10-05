@@ -22,6 +22,7 @@ from app.payload import stable_digest
 from app.server import create_server
 
 EVENTS_PATH = "/api/telemetry/events"
+RECOVER_PATH = "/api/telemetry/events/recover"
 
 
 def _iso(ts: float) -> str:
@@ -69,8 +70,9 @@ class ServerFixture:
         self.thread.join(timeout=5)
 
 
-def post(url: str, raw: bytes, headers: dict) -> tuple[int, dict]:
-    req = urllib.request.Request(url + EVENTS_PATH, data=raw,
+def post(url: str, raw: bytes, headers: dict,
+         path: str = EVENTS_PATH) -> tuple[int, dict]:
+    req = urllib.request.Request(url + path, data=raw,
                                  headers=dict(headers), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -85,9 +87,10 @@ def get(url: str, path: str) -> tuple[int, dict]:
 
 
 def signed_headers(key: dict, timestamp: int, nonce: str, raw: bytes,
-                   station: str | None = None, secret: str | None = None) -> dict:
+                   station: str | None = None, secret: str | None = None,
+                   path: str = EVENTS_PATH) -> dict:
     station = station or key["station_id"]
-    signature = auth.sign_request(secret or key["secret"], "POST", EVENTS_PATH,
+    signature = auth.sign_request(secret or key["secret"], "POST", path,
                                   station, key["key_id"], str(timestamp), nonce, raw)
     return {
         "X-Station-Id": station,
@@ -328,6 +331,224 @@ class ApiTest(unittest.TestCase):
             self.fail("expected HTTPError")
         except urllib.error.HTTPError as exc:
             self.assertEqual(exc.code, 404)
+
+
+class RecoverTest(unittest.TestCase):
+    """POST /api/telemetry/events/recover：丢失 202 的恢复确认。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.keys_file = os.path.join(self.tmp.name, "keys.json")
+        self.keys = _write_keys(self.keys_file)
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        self.server = ServerFixture(self.data_dir, self.keys_file)
+        self.key = self.keys["active"]
+
+    def tearDown(self):
+        self.server.stop()
+        self.tmp.cleanup()
+
+    def _nonce(self) -> str:
+        return secrets.token_hex(12)
+
+    def _accept(self, payload: dict | None = None, nonce: str | None = None,
+                raw: bytes | None = None):
+        """接纳一个事件，返回 (响应状态, 响应体, 原始字节, nonce, 载荷)。"""
+        payload = payload if payload is not None else make_payload("st-1")
+        raw = raw if raw is not None else json.dumps(payload).encode()
+        nonce = nonce or self._nonce()
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, body = post(self.server.url, raw, headers)
+        self.assertEqual(status, 202, f"accept failed: {body}")
+        return body, raw, nonce, payload
+
+    def _recover(self, raw: bytes, nonce: str, key: dict | None = None,
+                 station: str | None = None, path: str = RECOVER_PATH,
+                 extra_headers: dict | None = None):
+        key = key or self.key
+        headers = signed_headers(key, int(time.time()), nonce, raw,
+                                 station=station, path=path)
+        if extra_headers:
+            headers.update(extra_headers)
+        return post(self.server.url, raw, headers, path=RECOVER_PATH)
+
+    # ---------- 成功恢复 ----------
+    def test_recover_returns_original_receipt(self):
+        accepted, raw, nonce, payload = self._accept()
+        status, body = self._recover(raw, nonce)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "recovered")
+        self.assertEqual(body["station_id"], "st-1")
+        self.assertEqual(body["nonce"], nonce)
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+        self.assertEqual(body["received_at"], accepted["received_at"])
+        expected, _ = stable_digest(payload)
+        self.assertEqual(body["event_digest"], expected)
+
+    def test_recover_gzip_accepted_plain_recovered(self):
+        """gzip 接纳、明文恢复：稳定摘要与传输编码无关。"""
+        payload = make_payload("st-1")
+        compressed = gzip.compress(json.dumps(payload).encode())
+        nonce = self._nonce()
+        headers = signed_headers(self.key, int(time.time()), nonce, compressed)
+        headers["Content-Encoding"] = "gzip"
+        status, accepted = post(self.server.url, compressed, headers)
+        self.assertEqual(status, 202)
+
+        plain = json.dumps(payload).encode()
+        status, body = self._recover(plain, nonce)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+        self.assertEqual(body["received_at"], accepted["received_at"])
+
+    def test_recover_gzip_request(self):
+        accepted, raw, nonce, _ = self._accept()
+        compressed = gzip.compress(raw)
+        status, body = self._recover(compressed, nonce,
+                                     extra_headers={"Content-Encoding": "gzip"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+
+    # ---------- 失败路径 ----------
+    def test_recover_unknown_nonce_404(self):
+        raw = json.dumps(make_payload("st-1")).encode()
+        status, body = self._recover(raw, self._nonce())
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "RECEIPT_NOT_FOUND")
+
+    def test_recover_mismatch_409(self):
+        _, _, nonce, _ = self._accept()
+        other = json.dumps(make_payload("st-1")).encode()  # 同站点不同内容
+        status, body = self._recover(other, nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "RECEIPT_MISMATCH")
+
+    def test_recover_legacy_volume_409_unavailable(self):
+        """旧数据卷：仅有防重放记录、无回执 -> 409 RECEIPT_UNAVAILABLE。"""
+        _, raw, nonce, _ = self._accept()
+        # 模拟旧版本写入的数据卷：删掉回执表内容，仅保留 nonces 防重放记录
+        self.server.stop()
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(self.data_dir, "telemetry.db"))
+        conn.execute("DROP TABLE receipts")
+        conn.commit()
+        conn.close()
+        self.server = ServerFixture(self.data_dir, self.keys_file)
+
+        status, body = self._recover(raw, nonce)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "RECEIPT_UNAVAILABLE")
+        # 防重放语义在旧卷上依然成立
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, body = post(self.server.url, raw, headers)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "NONCE_REPLAY")
+
+    def test_recover_signature_must_bind_recover_path(self):
+        """沿用事件路径的签名在恢复路径上必须失败（路径参与规范化串）。"""
+        _, raw, nonce, _ = self._accept()
+        headers = signed_headers(self.key, int(time.time()), nonce, raw,
+                                 path=EVENTS_PATH)
+        status, body = post(self.server.url, raw, headers, path=RECOVER_PATH)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "SIGNATURE_INVALID")
+
+    def test_recover_bad_signature_401(self):
+        _, raw, nonce, _ = self._accept()
+        headers = signed_headers(self.key, int(time.time()), nonce, raw,
+                                 path=RECOVER_PATH)
+        headers["X-Signature"] = tamper_signature(headers["X-Signature"])
+        status, body = post(self.server.url, raw, headers, path=RECOVER_PATH)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "SIGNATURE_INVALID")
+
+    def test_recover_stale_timestamp_401(self):
+        _, raw, nonce, _ = self._accept()
+        headers = signed_headers(self.key, int(time.time()) - 3600, nonce, raw,
+                                 path=RECOVER_PATH)
+        status, body = post(self.server.url, raw, headers, path=RECOVER_PATH)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "TIMESTAMP_OUT_OF_RANGE")
+
+    def test_recover_expired_key_403(self):
+        raw = json.dumps(make_payload("st-1")).encode()
+        headers = signed_headers(self.keys["expired"], int(time.time()),
+                                 self._nonce(), raw, path=RECOVER_PATH)
+        status, body = post(self.server.url, raw, headers, path=RECOVER_PATH)
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "KEY_EXPIRED")
+
+    # ---------- 不泄露他站结果 ----------
+    def test_recover_other_station_gets_404(self):
+        """st-2 用自己的密钥查询 st-1 的 nonce：只能得到 404，不泄露任何结果。"""
+        _, _, nonce, _ = self._accept()
+        raw = json.dumps(make_payload("st-2")).encode()
+        status, body = self._recover(raw, nonce, key=self.keys["other"])
+        self.assertEqual(status, 404)
+        self.assertEqual(body["error"]["code"], "RECEIPT_NOT_FOUND")
+
+    def test_recover_with_other_stations_key_rejected(self):
+        """持 st-2 密钥冒用 st-1 站点头：密钥站点绑定检查先行拒绝。"""
+        _, raw, nonce, _ = self._accept()
+        status, body = self._recover(raw, nonce, key=self.keys["other"],
+                                     station="st-1")
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"]["code"], "KEY_STATION_MISMATCH")
+
+    # ---------- 恢复不登记、不改写 nonce ----------
+    def test_recover_does_not_register_nonce(self):
+        nonce = self._nonce()
+        raw = json.dumps(make_payload("st-1")).encode()
+        status, _ = self._recover(raw, nonce)
+        self.assertEqual(status, 404)
+        # 恢复查询不得占用 nonce：同一 nonce 随后可正常接纳
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, body = post(self.server.url, raw, headers)
+        self.assertEqual(status, 202, f"nonce consumed by recover! {body}")
+
+    def test_recover_does_not_modify_receipt(self):
+        accepted, raw, nonce, _ = self._accept()
+        for _ in range(3):
+            status, body = self._recover(raw, nonce)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["received_at"], accepted["received_at"])
+        # 恢复之后原事件重放仍被拒绝（防重放记录未被改写）
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, body = post(self.server.url, raw, headers)
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"]["code"], "NONCE_REPLAY")
+
+    # ---------- 重启与并发 ----------
+    def test_recover_survives_restart(self):
+        accepted, raw, nonce, _ = self._accept()
+        self.server.stop()
+        self.server = ServerFixture(self.data_dir, self.keys_file)
+        status, body = self._recover(raw, nonce)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "recovered")
+        self.assertEqual(body["event_digest"], accepted["event_digest"])
+        self.assertEqual(body["received_at"], accepted["received_at"])
+
+    def test_concurrent_recover_all_200_and_single_acceptance(self):
+        """并发重试：接纳至多一次；恢复查询幂等，全部拿到同一回执。"""
+        accepted, raw, nonce, _ = self._accept()
+        barrier = threading.Barrier(16)
+
+        def worker():
+            barrier.wait(timeout=10)
+            return self._recover(raw, nonce)
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: worker(), range(16)))
+        codes = [s for s, _ in results]
+        self.assertEqual(codes.count(200), 16, f"codes={codes}")
+        for _, body in results:
+            self.assertEqual(body["event_digest"], accepted["event_digest"])
+            self.assertEqual(body["received_at"], accepted["received_at"])
+        # 并发恢复之后，原事件重放仍是 409：接纳记录始终只有一条
+        headers = signed_headers(self.key, int(time.time()), nonce, raw)
+        status, _ = post(self.server.url, raw, headers)
+        self.assertEqual(status, 409)
 
 
 if __name__ == "__main__":

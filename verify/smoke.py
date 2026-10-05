@@ -1,4 +1,9 @@
-"""对运行中的网关执行端到端冒烟：签名、压缩、时间窗、密钥有效期、防重放（含并发）。"""
+"""对运行中的网关执行端到端冒烟：签名、压缩、时间窗、密钥有效期、防重放（含并发）
+与丢失回执恢复（恢复/冲突/不泄露/不占 nonce）。
+
+注：重启持久化与旧数据卷（仅有防重放记录）场景由单元测试覆盖，
+verify.run 会先跑单元测试再执行本冒烟。
+"""
 from __future__ import annotations
 
 import gzip
@@ -15,6 +20,7 @@ from app.keystore import KeyStore
 from app.payload import stable_digest
 
 EVENTS_PATH = "/api/telemetry/events"
+RECOVER_PATH = "/api/telemetry/events/recover"
 
 
 class SmokeFailure(Exception):
@@ -27,8 +33,8 @@ def _expect(condition: bool, message: str) -> None:
 
 
 def _post(base_url: str, raw: bytes, headers: dict,
-          timeout: float = 10.0) -> tuple[int, dict]:
-    req = urllib.request.Request(base_url + EVENTS_PATH, data=raw,
+          path: str = EVENTS_PATH, timeout: float = 10.0) -> tuple[int, dict]:
+    req = urllib.request.Request(base_url + path, data=raw,
                                  headers=dict(headers), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -38,8 +44,8 @@ def _post(base_url: str, raw: bytes, headers: dict,
 
 
 def _headers_for(key, timestamp: int, nonce: str, raw: bytes,
-                 secret: str | None = None) -> dict:
-    signature = auth.sign_request(secret or key.secret, "POST", EVENTS_PATH,
+                 secret: str | None = None, path: str = EVENTS_PATH) -> dict:
+    signature = auth.sign_request(secret or key.secret, "POST", path,
                                   key.station_id, key.key_id, str(timestamp),
                                   nonce, raw)
     return {
@@ -95,6 +101,7 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
         _expect(body.get("event_digest") == expected,
                 f"digest mismatch: {body.get('event_digest')} != {expected}")
         ctx["json"] = (raw, headers, expected)
+        ctx["accepted"] = body
 
     def case_happy_gzip_same_digest():
         raw_plain = json.dumps(_payload(active.station_id)).encode()
@@ -202,7 +209,8 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
 
     def case_concurrent_replay_exactly_one_wins():
         raw = json.dumps(_payload(active.station_id)).encode()
-        headers = _headers_for(active, int(time.time()), _nonce(), raw)
+        nonce = _nonce()
+        headers = _headers_for(active, int(time.time()), nonce, raw)
         barrier = threading.Barrier(16)
 
         def worker():
@@ -216,6 +224,108 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
                 f"expected exactly one 202, got codes={codes}")
         _expect(codes.count(409) == 15,
                 f"expected fifteen 409, got codes={codes}")
+        ctx["concurrent"] = (raw, nonce)
+
+    # ---------- 丢失回执的恢复 ----------
+    def case_recover_happy():
+        raw, headers, _ = ctx["json"]
+        accepted = ctx["accepted"]
+        nonce = headers["X-Nonce"]
+        # 新的时刻与签名（路径换成恢复路径），载荷与 nonce 不变
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, raw, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}: {body}")
+        _expect(body.get("status") == "recovered",
+                f"expected status=recovered, got {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest differs from accepted digest")
+        _expect(body.get("received_at") == accepted["received_at"],
+                "recovered received_at differs from accepted received_at")
+
+    def case_recover_gzip_transport_independent():
+        """gzip 接纳、明文恢复：同一事件内容摘要恒定，恢复与传输编码无关。"""
+        payload = _payload(active.station_id)
+        plain = json.dumps(payload).encode()
+        compressed = gzip.compress(plain)
+        nonce = _nonce()
+        headers = _headers_for(active, int(time.time()), nonce, compressed)
+        headers["Content-Encoding"] = "gzip"
+        status, accepted = _post(base_url, compressed, headers)
+        _expect(status == 202, f"expected 202, got {status}: {accepted}")
+        recover_headers = _headers_for(active, int(time.time()), nonce, plain,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, plain, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}: {body}")
+        _expect(body.get("event_digest") == accepted["event_digest"],
+                "recovered digest should equal gzip-accepted digest")
+
+    def case_recover_unknown_nonce_404():
+        raw = json.dumps(_payload(active.station_id)).encode()
+        headers = _headers_for(active, int(time.time()), _nonce(), raw,
+                               path=RECOVER_PATH)
+        status, body = _post(base_url, raw, headers, path=RECOVER_PATH)
+        _expect(status == 404 and body["error"]["code"] == "RECEIPT_NOT_FOUND",
+                f"expected 404 RECEIPT_NOT_FOUND, got {status}: {body}")
+
+    def case_recover_mismatch_409():
+        nonce = _nonce()
+        raw = json.dumps(_payload(active.station_id)).encode()
+        headers = _headers_for(active, int(time.time()), nonce, raw)
+        status, _ = _post(base_url, raw, headers)
+        _expect(status == 202, f"accept failed: {status}")
+        other = json.dumps(_payload(active.station_id)).encode()  # 同站点不同内容
+        recover_headers = _headers_for(active, int(time.time()), nonce, other,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, other, recover_headers, path=RECOVER_PATH)
+        _expect(status == 409 and body["error"]["code"] == "RECEIPT_MISMATCH",
+                f"expected 409 RECEIPT_MISMATCH, got {status}: {body}")
+
+    def case_recover_signature_must_bind_recover_path():
+        raw, _, _ = ctx["json"]
+        nonce = _nonce()
+        # 用事件路径签名打到恢复路径上：必须 401
+        headers = _headers_for(active, int(time.time()), nonce, raw,
+                               path=EVENTS_PATH)
+        status, body = _post(base_url, raw, headers, path=RECOVER_PATH)
+        _expect(status == 401 and body["error"]["code"] == "SIGNATURE_INVALID",
+                f"expected 401 SIGNATURE_INVALID, got {status}: {body}")
+
+    def case_recover_does_not_consume_nonce():
+        nonce = _nonce()
+        raw = json.dumps(_payload(active.station_id)).encode()
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw,
+                                       path=RECOVER_PATH)
+        status, _ = _post(base_url, raw, recover_headers, path=RECOVER_PATH)
+        _expect(status == 404, f"expected 404, got {status}")
+        # 恢复查询不得登记 nonce：同一 nonce 随后可正常接纳
+        headers = _headers_for(active, int(time.time()), nonce, raw)
+        status, body = _post(base_url, raw, headers)
+        _expect(status == 202,
+                f"nonce consumed by recover! got {status}: {body}")
+
+    def case_recover_then_replay_still_409():
+        """恢复不改写防重放记录：恢复成功后原事件重放仍是 409。"""
+        raw, headers, _ = ctx["json"]
+        nonce = headers["X-Nonce"]
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw,
+                                       path=RECOVER_PATH)
+        status, _ = _post(base_url, raw, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}")
+        status, body = _post(base_url, raw, headers)  # 原样重放首个成功请求
+        _expect(status == 409 and body["error"]["code"] == "NONCE_REPLAY",
+                f"expected 409 NONCE_REPLAY, got {status}: {body}")
+
+    def case_recover_after_concurrent_burst():
+        """16 路并发重试只接纳一次：恢复拿到的正是那一次的回执。"""
+        raw, nonce = ctx["concurrent"]
+        recover_headers = _headers_for(active, int(time.time()), nonce, raw,
+                                       path=RECOVER_PATH)
+        status, body = _post(base_url, raw, recover_headers, path=RECOVER_PATH)
+        _expect(status == 200, f"expected 200, got {status}: {body}")
+        expected, _ = stable_digest(json.loads(raw.decode()))
+        _expect(body.get("event_digest") == expected,
+                "recovered digest mismatch after concurrent burst")
 
     cases = [
         ("happy_json_202_stable_digest", case_happy_json),
@@ -234,6 +344,15 @@ def run_smoke(base_url: str, keys_file: str) -> bool:
          case_bad_signature_does_not_consume_nonce),
         ("replay_409", case_replay_rejected),
         ("concurrent_replay_exactly_one_wins", case_concurrent_replay_exactly_one_wins),
+        ("recover_happy_200", case_recover_happy),
+        ("recover_gzip_transport_independent", case_recover_gzip_transport_independent),
+        ("recover_unknown_nonce_404", case_recover_unknown_nonce_404),
+        ("recover_mismatch_409", case_recover_mismatch_409),
+        ("recover_signature_binds_recover_path",
+         case_recover_signature_must_bind_recover_path),
+        ("recover_does_not_consume_nonce", case_recover_does_not_consume_nonce),
+        ("recover_then_replay_still_409", case_recover_then_replay_still_409),
+        ("recover_after_concurrent_burst", case_recover_after_concurrent_burst),
     ]
 
     all_ok = True

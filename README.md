@@ -3,6 +3,8 @@
 辐射监测站通过不稳定专网上报剂量事件。本网关接收 `POST /api/telemetry/events`
 （JSON 或 gzip 压缩 JSON），通过 **HMAC-SHA256 签名**验证报文确由已登记设备发送，
 并以 **持久化 nonce 登记**阻止截获数据被再次接纳（并发请求与服务重启后均至多成功一次）。
+专网抖动导致 202 响应丢失时，监测站可用 `POST /api/telemetry/events/recover`
+在不再次接纳事件的前提下确认原接纳结果。
 
 纯 Python 标准库实现，零第三方依赖。
 
@@ -33,8 +35,8 @@ GATEWAY_URL=http://127.0.0.1:8000 python3 -m verify.run # 完整验证（含冒�
 ## verify 服务退出码
 
 `verify` 一次性服务依次执行构建检查（全量源码编译 + 模块导入）、单元测试、
-端到端冒烟（签名、压缩、时间窗、密钥有效期、失败不占 nonce、重放、16 路并发防重放），
-退出码按位汇总：
+端到端冒烟（签名、压缩、时间窗、密钥有效期、失败不占 nonce、重放、16 路并发
+防重放、回执恢复与冲突），退出码按位汇总：
 
 | 退出码 | 含义 |
 |---|---|
@@ -107,6 +109,31 @@ HMAC 密钥为该 `X-Key-Id` 对应密钥的 UTF-8 字节。
 `event_digest` 为稳定事件摘要：同一事件内容（无论键序、空白、JSON 或 gzip 传输）
 摘要恒定。
 
+### `POST /api/telemetry/events/recover`
+
+专网抖动可能使事件已被网关接纳、202 响应却中途丢失。恢复端点让监测站
+**在不再次接纳事件的前提下确认原结果**：请求头、JSON/gzip 载荷与签名规则
+与接纳接口完全相同，仅签名规范化串中的路径换成
+`/api/telemetry/events/recover`（两路径签名不通用）。`X-Timestamp` 取当前
+时刻（同样受五分钟时间窗约束），`X-Nonce` 与原事件一致，载荷为原事件内容。
+
+网关完成密钥、时间窗、签名与载荷校验后，按（站点、nonce、稳定事件摘要）
+**只读**核对接纳回执——恢复不登记也不改写 nonce：
+
+- 完全一致 → `200`：
+
+  ```json
+  {"status": "recovered", "station_id": "station-alpha", "nonce": "…",
+   "event_digest": "<首次接纳的摘要>", "received_at": 1791163601}
+  ```
+
+- nonce 从未登记 → `404 RECEIPT_NOT_FOUND`
+- 载荷摘要与首次接纳不一致 → `409 RECEIPT_MISMATCH`
+- 旧数据卷仅有防重放记录、无回执可还原 → `409 RECEIPT_UNAVAILABLE`
+
+回执按站点隔离：他站密钥查询本站点 nonce 只能得到 `404`，失败响应不泄露
+其他站点的接纳结果。
+
 失败响应统一为 `{"error": {"code", "message", "detail?"}}`，可区分代码：
 
 | HTTP | code | 含义 |
@@ -119,6 +146,9 @@ HMAC 密钥为该 `X-Key-Id` 对应密钥的 UTF-8 字节。
 | 403 | `KEY_EXPIRED` | 密钥已过期或尚未生效 |
 | 403 | `KEY_STATION_MISMATCH` | 密钥未绑定该站点 |
 | 409 | `NONCE_REPLAY` | 同站点 nonce 已成功使用过（重放） |
+| 404 | `RECEIPT_NOT_FOUND` | 恢复：该站点从未登记此 nonce |
+| 409 | `RECEIPT_MISMATCH` | 恢复：载荷摘要与首次接纳不一致 |
+| 409 | `RECEIPT_UNAVAILABLE` | 恢复：旧数据卷仅有防重放记录，无回执可还原 |
 | 411 | `LENGTH_REQUIRED` | 缺少 Content-Length |
 | 413 | `PAYLOAD_TOO_LARGE` | 请求体或解压后超限 |
 | 415 | `UNSUPPORTED_ENCODING` | 不支持的 Content-Encoding |
@@ -128,13 +158,16 @@ HMAC 密钥为该 `X-Key-Id` 对应密钥的 UTF-8 字节。
 1. 请求头齐全性/格式 → 2. 读取原始体 → 3. 时间窗 → 4. 密钥登记/有效期/站点绑定
 → 5. **验签** → 6. **解压与事件校验** → 7. 事务性登记 nonce → 8. `202`
 
+恢复接口复用同一套 1–6 步校验（仅验签路径不同），第 7 步改为只读核对回执，
+第 8 步返回 `200`；它不登记、不改写 nonce，失败同样不留痕迹。
+
 - **先验签再解压**：签名覆盖传输原始字节，验签通过前不解压、不解析。
 - **失败请求不占用 nonce**：nonce 仅在全部校验通过、即将接纳时写入；
   签名错误、载荷畸形等失败路径不留痕迹，客户端可修正后用同一 nonce 重试。
 - **至多成功一次**：nonce 以 `(station_id, nonce)` 主键存入 SQLite（WAL +
   `synchronous=FULL`），插入即接纳；并发冲突由唯一约束兜底，16 路并发同一
   nonce 仅 1 个 `202`、其余 `409`。数据库落在 `DATA_DIR`（Compose 命名卷
-  `app-data`），服务重启后重放仍返回 `409`。
+  `app-data`），服务重启后重放仍返回 `409`，恢复仍返回首次接纳的回执。
 
 ## 客户端示例
 
@@ -163,6 +196,10 @@ print(urllib.request.urlopen(req).read().decode())
 
 gzip 发送：将 `body` 替换为 `gzip.compress(body)` 并加头
 `"Content-Encoding": "gzip"` 即可（签名对压缩后字节计算）。
+
+恢复丢失的 202：用**同一 nonce、同一事件内容**重新计算签名
+（规范化串第二行改为 `/api/telemetry/events/recover`，`X-Timestamp` 取当前
+时刻），POST 到恢复路径；返回 `200` 即原接纳结果，`404`/`409` 见上文错误表。
 
 ## 配置
 
@@ -194,7 +231,7 @@ gzip 发送：将 `body` 替换为 `gzip.compress(body)` 并加头
 ```
 app/            网关实现（server/auth/keystore/store/payload/config/errors）
 keys/keys.json  默认测试密钥
-tests/          单元与端到端测试（49 例，含并发与重启持久化）
+tests/          单元与端到端测试（72 例，含并发、重启持久化、旧数据卷与回执恢复）
 verify/         一次性验证服务（run.py 汇总退出码，smoke.py 冒烟用例）
 Dockerfile      应用镜像（python:3.12-slim，非 root 运行，构建期语法门禁）
 docker-compose.yml  app（健康检查 + HOST_PORT 可配置）+ verify 一次性服务

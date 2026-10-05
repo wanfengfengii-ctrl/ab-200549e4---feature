@@ -1,6 +1,7 @@
-"""HTTP 网关：POST /api/telemetry/events 的验签、解压、校验与防重放接纳。
+"""HTTP 网关：遥测事件的验签接纳与丢失回执的恢复确认。
 
-处理顺序（严格保证"先验签，再解压/校验"，且失败请求不占用 nonce）：
+接纳 POST /api/telemetry/events 的处理顺序（严格保证"先验签，再解压/校验"，
+且失败请求不占用 nonce）：
 
     1. 必需请求头齐全且格式合法          -> 400 MALFORMED_HEADERS
     2. 读取原始请求体（带大小上限）       -> 411 / 413
@@ -10,6 +11,16 @@
     6. 解压 + JSON 解析 + 事件校验        -> 400 PAYLOAD_MALFORMED / 415 UNSUPPORTED_ENCODING
     7. 事务性登记 nonce（唯一约束）       -> 409 NONCE_REPLAY
     8. 接纳                              -> 202 + 稳定事件摘要
+
+恢复 POST /api/telemetry/events/recover 复用完全相同的 1–6 步校验管线
+（仅签名规范化串中的路径换成本路径），随后按 (站点, nonce, 稳定事件摘要)
+只读核对接纳回执，不登记也不改写 nonce：
+
+    7. 回执核对：nonce 未登记            -> 404 RECEIPT_NOT_FOUND
+                 旧数据卷仅有防重放记录  -> 409 RECEIPT_UNAVAILABLE
+                 摘要与首次接纳不一致    -> 409 RECEIPT_MISMATCH
+    8. 完全一致                          -> 200 + status=recovered + 首次接纳的
+                                            event_digest 与 received_at
 """
 from __future__ import annotations
 
@@ -20,6 +31,7 @@ import re
 import signal
 import threading
 import time
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import auth
@@ -27,11 +39,12 @@ from . import payload as payload_mod
 from .config import Config
 from .errors import ApiError
 from .keystore import KeyStore
-from .store import Store
+from .store import RECEIPT_MISSING, RECEIPT_UNAVAILABLE, Store
 
 log = logging.getLogger("gateway")
 
 EVENTS_PATH = "/api/telemetry/events"
+RECOVER_PATH = "/api/telemetry/events/recover"
 _NONCE_RE = re.compile(r"[A-Za-z0-9._~-]{8,128}")
 
 
@@ -42,6 +55,17 @@ class Gateway:
         self.config = config
         self.keystore = keystore
         self.store = store
+
+
+@dataclass
+class _ValidatedRequest:
+    """通过全部入学校验的请求：接纳与恢复两条路径共用。"""
+    station_id: str
+    key_id: str
+    nonce: str
+    now: float
+    digest: str
+    canonical_payload: str
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -57,9 +81,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path != EVENTS_PATH:
+            if self.path == EVENTS_PATH:
+                status, body = self._handle_events()
+            elif self.path == RECOVER_PATH:
+                status, body = self._handle_recover()
+            else:
                 raise ApiError(404, "NOT_FOUND", "unknown path")
-            status, body = self._handle_events()
         except ApiError as exc:
             status, body = exc.status, exc.to_dict()
             log.info("reject %s -> %d %s", self.path, exc.status, exc.code)
@@ -76,6 +103,62 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- 主流程 ----------
     def _handle_events(self) -> tuple[int, dict]:
+        gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
+        req = self._validate_request(EVENTS_PATH)
+
+        # 全部校验通过，事务性登记 nonce；冲突即重放
+        accepted = gateway.store.record_acceptance(
+            req.station_id, req.nonce, req.key_id, req.digest,
+            req.canonical_payload, req.now)
+        if not accepted:
+            raise ApiError(409, "NONCE_REPLAY", "nonce already used for this station")
+
+        log.info("accepted station=%s key=%s nonce=%s digest=%s",
+                 req.station_id, req.key_id, req.nonce, req.digest)
+        return 202, {
+            "status": "accepted",
+            "station_id": req.station_id,
+            "nonce": req.nonce,
+            "event_digest": req.digest,
+            "received_at": int(req.now),
+        }
+
+    def _handle_recover(self) -> tuple[int, dict]:
+        """确认丢失的 202 结果：与接纳相同的鉴权与载荷校验，但只读不回写。"""
+        gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
+        req = self._validate_request(RECOVER_PATH)
+
+        state, receipt = gateway.store.lookup_receipt(req.station_id, req.nonce)
+        if state == RECEIPT_MISSING:
+            raise ApiError(404, "RECEIPT_NOT_FOUND",
+                           "no acceptance recorded for this station and nonce")
+        if state == RECEIPT_UNAVAILABLE:
+            raise ApiError(409, "RECEIPT_UNAVAILABLE",
+                           "nonce was registered before receipts were kept; "
+                           "the original result cannot be recovered")
+        assert receipt is not None  # RECEIPT_OK 时必有回执
+        if receipt.digest != req.digest:
+            raise ApiError(409, "RECEIPT_MISMATCH",
+                           "payload does not match the event accepted "
+                           "under this nonce")
+
+        log.info("recovered station=%s nonce=%s digest=%s",
+                 req.station_id, req.nonce, receipt.digest)
+        return 200, {
+            "status": "recovered",
+            "station_id": req.station_id,
+            "nonce": req.nonce,
+            "event_digest": receipt.digest,
+            "received_at": int(receipt.received_at),
+        }
+
+    def _validate_request(self, path: str) -> _ValidatedRequest:
+        """接纳与恢复共用的校验管线（处理顺序与失败语义完全一致）：
+
+        请求头 -> 原始请求体 -> 五分钟时间窗 -> 密钥登记/有效期/站点绑定
+        -> 按给定路径验签 -> 解压/解析/校验事件 -> 稳定事件摘要。
+        任何一步失败都抛 ApiError，且不触碰 nonce 存储。
+        """
         gateway: Gateway = self.server.gateway  # type: ignore[attr-defined]
         config = gateway.config
 
@@ -113,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(403, "KEY_STATION_MISMATCH",
                            "key is not registered for this station")
 
-        canonical = auth.canonical_string("POST", EVENTS_PATH, station_id, key_id,
+        canonical = auth.canonical_string("POST", path, station_id, key_id,
                                           ts_raw, nonce, raw_body)
         if not auth.verify_signature(key.secret, canonical, signature):
             raise ApiError(401, "SIGNATURE_INVALID", "signature verification failed")
@@ -125,21 +208,9 @@ class Handler(BaseHTTPRequestHandler):
         obj = payload_mod.parse_and_validate(data, station_id, now)
         digest, canonical_payload = payload_mod.stable_digest(obj)
 
-        # 全部校验通过，事务性登记 nonce；冲突即重放
-        accepted = gateway.store.record_acceptance(
-            station_id, nonce, key_id, digest, canonical_payload, now)
-        if not accepted:
-            raise ApiError(409, "NONCE_REPLAY", "nonce already used for this station")
-
-        log.info("accepted station=%s key=%s nonce=%s digest=%s",
-                 station_id, key_id, nonce, digest)
-        return 202, {
-            "status": "accepted",
-            "station_id": station_id,
-            "nonce": nonce,
-            "event_digest": digest,
-            "received_at": int(now),
-        }
+        return _ValidatedRequest(
+            station_id=station_id, key_id=key_id, nonce=nonce, now=now,
+            digest=digest, canonical_payload=canonical_payload)
 
     # ---------- 工具 ----------
     def _required_header(self, name: str) -> str:
